@@ -2,6 +2,9 @@
   "functions": {
     "api/scan.py": {
       "maxDuration": 300
+    },
+    "api/stock.py": {
+      "maxDuration": 60
     }
   },
   "crons": [

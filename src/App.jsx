@@ -930,6 +930,30 @@ function formatVolume(vol) {
   return String(Math.round(vol));
 }
 
+function formatMoneyCompact(val, currency = '$') {
+  if (!Number.isFinite(val) || val === 0) return '—';
+  if (currency === '₹') {
+    const cr = val / 1e7;
+    if (cr >= 1000) return `₹${(cr / 1000).toFixed(2)}K Cr`;
+    if (cr >= 1) return `₹${cr.toFixed(0)} Cr`;
+    return `₹${val.toLocaleString()}`;
+  }
+  if (val >= 1e12) return `${currency}${(val / 1e12).toFixed(2)}T`;
+  if (val >= 1e9) return `${currency}${(val / 1e9).toFixed(2)}B`;
+  if (val >= 1e6) return `${currency}${(val / 1e6).toFixed(1)}M`;
+  return `${currency}${val.toLocaleString()}`;
+}
+
+function formatPctRatio(val) {
+  if (!Number.isFinite(val)) return '—';
+  return `${(val * 100).toFixed(2)}%`;
+}
+
+function formatNum(val, suffix = '') {
+  if (!Number.isFinite(val)) return '—';
+  return `${val}${suffix}`;
+}
+
 function evaluateMaRule(stock, rule) {
   const tfMa = stock.ma?.[rule.timeframe];
   if (!tfMa) return false;
@@ -1034,6 +1058,14 @@ export default function App() {
   const [apiConnected, setApiConnected] = useState(false);
   const [customTickers, setCustomTickers] = useState({ US: [], IN: [] });
   const [customTickerInput, setCustomTickerInput] = useState('');
+  const [globalLookupQuery, setGlobalLookupQuery] = useState('');
+  const [lookupOpen, setLookupOpen] = useState(false);
+  const [lookupIdx, setLookupIdx] = useState(-1);
+  const lookupBoxRef = useRef(null);
+  const [deepDetail, setDeepDetail] = useState(null);
+  const [deepLoading, setDeepLoading] = useState(false);
+  const [deepError, setDeepError] = useState('');
+  const [drawerTab, setDrawerTab] = useState('overview'); // overview | technicals | fundamentals | insiders | news
   const [datasets, setDatasets] = useState(INITIAL_DATASETS);
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
   const [activePresetId, setActivePresetId] = useState('all');
@@ -1324,10 +1356,157 @@ export default function App() {
   );
 
   // Handlers
+  // Close autocomplete dropdown on outside click
+  useEffect(() => {
+    const onDocClick = (ev) => {
+      if (lookupBoxRef.current && !lookupBoxRef.current.contains(ev.target)) {
+        setLookupOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
+  // Ranked ticker suggestions across BOTH US and India datasets
+  const lookupSuggestions = useMemo(() => {
+    const q = globalLookupQuery.trim().toUpperCase();
+    if (!q) return [];
+    const combined = [
+      ...(datasets.US?.stocks || []).map((s) => ({ ...s, mkt: 'US' })),
+      ...(datasets.IN?.stocks || []).map((s) => ({ ...s, mkt: 'IN' })),
+    ];
+    const scored = [];
+    for (const item of combined) {
+      const sym = (item.symbol || '').toUpperCase();
+      const name = (item.name || '').toUpperCase();
+      let rank = 99;
+      if (sym === q) rank = 0;
+      else if (sym.startsWith(q)) rank = 1;
+      else if (sym.includes(q)) rank = 2;
+      else if (name.includes(q)) rank = 3;
+      if (rank < 99) scored.push({ ...item, rank });
+    }
+    scored.sort((a, b) => a.rank - b.rank || a.symbol.localeCompare(b.symbol));
+    return scored.slice(0, 8);
+  }, [globalLookupQuery, datasets]);
+
   const switchMarket = (nextMarket) => {
     setMarket(nextMarket);
     setSelectedSymbol(null);
+    setDeepDetail(null);
     setFilters((f) => ({ ...f, search: '', universe: 'ALL', sector: 'ALL', pattern: 'ALL' }));
+  };
+
+  const fetchDeepStockDetail = async (symbolToLoad, targetMkt = 'AUTO') => {
+    const clean = (symbolToLoad || '').trim().toUpperCase();
+    if (!clean) return;
+    const baseSym = clean.replace(/\.(NS|BO)$/, '');
+    setLookupOpen(false);
+    setSelectedSymbol(baseSym);
+    setDrawerTab('overview');
+    setDeepLoading(true);
+    setDeepError('');
+    setDeepDetail(null);
+    try {
+      const res = await fetch(`/api/stock?symbol=${encodeURIComponent(clean)}&market=${targetMkt}`);
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error('Live research API unavailable in local preview');
+      }
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      setDeepDetail(data);
+    } catch (err) {
+      // Check BOTH US and IN datasets in preview fallback
+      let foundMkt = null;
+      let localMatch = null;
+      if (clean.endsWith('.NS') || clean.endsWith('.BO')) {
+        localMatch = (datasets.IN?.stocks || []).find((s) => s.symbol === baseSym);
+        if (localMatch) foundMkt = 'IN';
+      } else if (targetMkt === 'US' || targetMkt === 'IN') {
+        localMatch = (datasets[targetMkt]?.stocks || []).find((s) => s.symbol === baseSym);
+        if (localMatch) foundMkt = targetMkt;
+      } else {
+        localMatch = (datasets[market]?.stocks || []).find((s) => s.symbol === baseSym);
+        if (localMatch) foundMkt = market;
+        else {
+          const other = market === 'US' ? 'IN' : 'US';
+          localMatch = (datasets[other]?.stocks || []).find((s) => s.symbol === baseSym);
+          if (localMatch) foundMkt = other;
+        }
+      }
+
+      if (localMatch && foundMkt) {
+        const mktMeta = datasets[foundMkt];
+        setDeepDetail({
+          ...localMatch,
+          market: foundMkt,
+          currency: mktMeta.currency,
+          exchange: mktMeta.exchange,
+          industry: localMatch.sector,
+          summary: 'Preview sample summary. Deploy on Vercel to load full Yahoo Finance fundamentals, insider transactions, institutional holders, and news for any ticker.',
+          fundamentals: {
+            marketCap: null, trailingPE: null, forwardPE: null, pegRatio: null,
+            priceToBook: null, priceToSales: null, evToEbitda: null,
+            roe: null, profitMargin: null, operatingMargin: null,
+            debtToEquity: null, currentRatio: null, revenueGrowth: null,
+            earningsGrowth: null, dividendYield: null, beta: null,
+            fiftyTwoWeekHigh: null, fiftyTwoWeekLow: null, targetMeanPrice: null,
+            recommendationKey: null,
+          },
+          ownership: {
+            heldPercentInsiders: null, heldPercentInstitutions: null,
+            shortRatio: null, shortPercentOfFloat: null,
+            insiderTransactions: [], institutionalHolders: [], majorHolders: [],
+          },
+          news: [],
+          chart: localMatch.history.map((c, idx) => ({ date: `T-${localMatch.history.length - 1 - idx}`, close: c })),
+        });
+      } else {
+        setDeepError(err.message || 'Could not load ticker details.');
+      }
+    } finally {
+      setDeepLoading(false);
+    }
+  };
+
+  const handleSelectSuggestion = (item) => {
+    setGlobalLookupQuery(item.symbol);
+    setLookupOpen(false);
+    setLookupIdx(-1);
+    fetchDeepStockDetail(item.symbol, item.mkt);
+  };
+
+  const handleGlobalLookupSubmit = (e) => {
+    e.preventDefault();
+    if (lookupOpen && lookupIdx >= 0 && lookupSuggestions[lookupIdx]) {
+      handleSelectSuggestion(lookupSuggestions[lookupIdx]);
+      return;
+    }
+    const q = globalLookupQuery.trim();
+    if (!q) return;
+    const exact = lookupSuggestions.find((s) => s.symbol.toUpperCase() === q.toUpperCase());
+    if (exact) {
+      handleSelectSuggestion(exact);
+    } else {
+      fetchDeepStockDetail(q, 'AUTO');
+    }
+  };
+
+  const handleLookupKeyDown = (e) => {
+    if (!lookupOpen || lookupSuggestions.length === 0) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setLookupIdx((i) => (i + 1) % lookupSuggestions.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setLookupIdx((i) => (i <= 0 ? lookupSuggestions.length - 1 : i - 1));
+    } else if (e.key === 'Escape') {
+      setLookupOpen(false);
+      setLookupIdx(-1);
+    }
   };
 
   const handleAddCustomTicker = (e) => {
@@ -1764,6 +1943,73 @@ export default function App() {
                 Auto-Refresh
               </button>
             </div>
+          </div>
+
+          {/* Top Global Stock Research Search (Auto-Detects US / India + Live Autocomplete) */}
+          <div ref={lookupBoxRef} className="relative flex-1 min-w-[240px] max-w-md">
+            <form onSubmit={handleGlobalLookupSubmit} className="flex items-center gap-1.5">
+              <div className="relative flex-1">
+                <Search className={`w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 ${subText}`} />
+                <input
+                  type="text"
+                  value={globalLookupQuery}
+                  onFocus={() => setLookupOpen(true)}
+                  onKeyDown={handleLookupKeyDown}
+                  onChange={(e) => {
+                    setGlobalLookupQuery(e.target.value);
+                    setLookupOpen(true);
+                    setLookupIdx(-1);
+                  }}
+                  placeholder="Research any US or NSE ticker (e.g. NVDA, TCS, ZOMATO)..."
+                  className={`w-full pl-8 pr-2.5 py-1.5 rounded-lg border text-xs font-mono uppercase outline-none ${inputCls}`}
+                />
+              </div>
+              <button
+                type="submit"
+                className="px-2.5 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold shrink-0"
+              >
+                Inspect
+              </button>
+            </form>
+
+            {lookupOpen && lookupSuggestions.length > 0 && (
+              <div
+                className={`absolute left-0 right-0 mt-1.5 rounded-xl border shadow-2xl overflow-hidden z-50 ${
+                  dark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-200'
+                }`}
+              >
+                {lookupSuggestions.map((item, idx) => (
+                  <button
+                    key={`${item.mkt}-${item.symbol}`}
+                    type="button"
+                    onClick={() => handleSelectSuggestion(item)}
+                    className={`w-full px-3 py-2 text-left flex items-center justify-between gap-2 text-xs transition-colors ${
+                      idx === lookupIdx
+                        ? dark
+                          ? 'bg-indigo-600/30 text-white'
+                          : 'bg-indigo-50 text-indigo-900'
+                        : dark
+                        ? 'hover:bg-slate-800 text-slate-200'
+                        : 'hover:bg-slate-50 text-slate-800'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="font-mono font-bold shrink-0">{item.symbol}</span>
+                      <span className={`truncate ${subText}`}>{item.name}</span>
+                    </div>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 ${
+                        item.mkt === 'IN'
+                          ? 'bg-amber-500/15 text-amber-400'
+                          : 'bg-indigo-500/15 text-indigo-400'
+                      }`}
+                    >
+                      {item.mkt === 'IN' ? 'NSE' : 'US'}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Right Controls */}
@@ -2446,7 +2692,7 @@ export default function App() {
                         return (
                           <tr
                             key={stock.symbol}
-                            onClick={() => setSelectedSymbol(stock.symbol)}
+                            onClick={() => fetchDeepStockDetail(stock.symbol, market)}
                             className={`cursor-pointer transition-colors ${
                               isSelected
                                 ? dark
@@ -2582,177 +2828,390 @@ export default function App() {
         </div>
       </div>
 
-      {/* Slide-Over Stock Detail Drawer */}
-      {selectedStock && (
-        <div className="fixed inset-0 z-40 flex justify-end bg-black/50 backdrop-blur-xs" onClick={() => setSelectedSymbol(null)}>
+      {/* Slide-Over Deep Stock Research Drawer (Any Ticker) */}
+      {(selectedSymbol || deepLoading) && (
+        <div
+          className="fixed inset-0 z-40 flex justify-end bg-black/55 backdrop-blur-xs"
+          onClick={() => {
+            setSelectedSymbol(null);
+            setDeepDetail(null);
+            setDeepError('');
+          }}
+        >
           <div
-            className={`w-full max-w-lg h-full overflow-y-auto p-5 border-l space-y-5 ${
+            className={`w-full max-w-2xl h-full overflow-y-auto p-5 border-l space-y-4 ${
               dark ? 'bg-slate-950 border-slate-800 text-slate-100' : 'bg-white border-slate-200 text-slate-900'
             }`}
             onClick={(e) => e.stopPropagation()}
           >
+            {/* Drawer Header */}
             <div className="flex items-start justify-between gap-3">
               <div>
-                <div className="flex items-center gap-2">
-                  <h2 className="text-xl font-bold">{selectedStock.symbol}</h2>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h2 className="text-xl font-bold">{deepDetail?.symbol || selectedSymbol}</h2>
                   <span className={`text-xs px-2 py-0.5 rounded-md font-medium ${dark ? 'bg-slate-800 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>
-                    {currentData.exchange} • {selectedStock.sector}
+                    {deepDetail?.exchange || currentData.exchange} • {deepDetail?.sector || 'Loading...'}
                   </span>
-                  {selectedStock.pattern && (
-                    <span className={`text-[11px] px-2 py-0.5 rounded-md border font-semibold whitespace-nowrap ${getPatternBadgeClass(selectedStock.pattern, dark)}`}>
-                      {selectedStock.pattern}
+                  {deepDetail?.pattern && (
+                    <span className={`text-[11px] px-2 py-0.5 rounded-md border font-semibold whitespace-nowrap ${getPatternBadgeClass(deepDetail.pattern, dark)}`}>
+                      {deepDetail.pattern}
                     </span>
                   )}
                 </div>
-                <p className={`text-xs mt-0.5 ${subText}`}>{selectedStock.name}</p>
+                <p className={`text-xs mt-0.5 ${subText}`}>
+                  {deepDetail?.name || 'Fetching full technical, fundamental & insider profile...'}
+                  {deepDetail?.industry && deepDetail.industry !== 'N/A' ? ` • ${deepDetail.industry}` : ''}
+                </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setSelectedSymbol(null)}
-                className={`p-1.5 rounded-lg border ${dark ? 'border-slate-800 hover:bg-slate-800' : 'border-slate-200 hover:bg-slate-100'}`}
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Price & Key Metrics */}
-            <div className="grid grid-cols-3 gap-2.5">
-              <div className={`p-3 rounded-xl border ${card}`}>
-                <div className={`text-[11px] ${subText}`}>Last Price</div>
-                <div className="text-base font-mono font-bold mt-0.5">
-                  {currentData.currency}{selectedStock.price.toLocaleString()}
-                </div>
-                <div className={`text-xs font-mono font-semibold ${selectedStock.changePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {selectedStock.changePct >= 0 ? '+' : ''}{selectedStock.changePct.toFixed(2)}%
-                </div>
-              </div>
-              <div className={`p-3 rounded-xl border ${card}`}>
-                <div className={`text-[11px] ${subText}`}>Relative Volume</div>
-                <div className="text-base font-mono font-bold text-cyan-400 mt-0.5">
-                  {selectedStock.rvol.toFixed(2)}x
-                </div>
-                <div className={`text-[11px] ${subText}`}>Vol {formatVolume(selectedStock.volume)}</div>
-              </div>
-              <div className={`p-3 rounded-xl border ${card}`}>
-                <div className={`text-[11px] ${subText}`}>RS vs {currentData.benchmark.symbol}</div>
-                <div className={`text-base font-mono font-bold mt-0.5 ${selectedStock.rsVsMarket >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                  {selectedStock.rsVsMarket >= 0 ? '+' : ''}{selectedStock.rsVsMarket.toFixed(2)}%
-                </div>
-                <div className={`text-[11px] ${subText}`}>
-                  {selectedStock.rsVsMarket >= 0 ? 'Outperforming' : 'Lagging'}
-                </div>
-              </div>
-            </div>
-
-            {/* Mini Price vs EMA Chart */}
-            <div className={`p-3.5 rounded-xl border ${card}`}>
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-bold">Recent Trend vs Daily EMA 20</span>
-                <a
-                  href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(selectedStock.tvSymbol || selectedStock.symbol)}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1 font-medium"
-                >
-                  Open TradingView <ExternalLink className="w-3 h-3" />
-                </a>
-              </div>
-              <div className="relative h-44 w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <ComposedChart
-                    data={selectedStock.history.map((p, idx) => ({
-                      bar: `T-${selectedStock.history.length - 1 - idx}`,
-                      price: p,
-                      ema20: selectedStock.ma.D.ema20,
-                    }))}
-                    margin={{ top: 8, right: 8, left: -16, bottom: 0 }}
+              <div className="flex items-center gap-2">
+                {deepDetail?.tvSymbol && (
+                  <a
+                    href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(deepDetail.tvSymbol)}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold flex items-center gap-1"
                   >
-                    <XAxis dataKey="bar" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-                    <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: dark ? '#0f172a' : '#ffffff',
-                        borderColor: dark ? '#334155' : '#e2e8f0',
-                        borderRadius: '10px',
-                        fontSize: '12px',
-                      }}
-                    />
-                    <Area
-                      type="monotone"
-                      dataKey="price"
-                      stroke="#6366f1"
-                      strokeWidth={2}
-                      fill="#6366f1"
-                      fillOpacity={0.18}
-                      isAnimationActive={false}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="ema20"
-                      stroke="#f59e0b"
-                      strokeDasharray="4 4"
-                      dot={false}
-                      strokeWidth={1.5}
-                      isAnimationActive={false}
-                    />
-                  </ComposedChart>
-                </ResponsiveContainer>
+                    TradingView <ExternalLink className="w-3 h-3" />
+                  </a>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedSymbol(null);
+                    setDeepDetail(null);
+                    setDeepError('');
+                  }}
+                  className={`p-1.5 rounded-lg border ${dark ? 'border-slate-800 hover:bg-slate-800' : 'border-slate-200 hover:bg-slate-100'}`}
+                >
+                  <X className="w-4 h-4" />
+                </button>
               </div>
             </div>
 
-            {/* Multi-Timeframe RSI Gauges */}
-            <div className={`p-3.5 rounded-xl border space-y-2.5 ${card}`}>
-              <h3 className="text-xs font-bold">Multi-Timeframe RSI (14)</h3>
-              {TIMEFRAMES.map((tf) => {
-                const val = selectedStock.rsi[tf.key];
-                return (
-                  <div key={tf.key} className="space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="font-medium">{tf.label}</span>
-                      <span className="font-mono font-bold">{val.toFixed(1)}</span>
+            {deepLoading && (
+              <div className={`p-4 rounded-xl border flex items-center gap-3 text-xs font-medium ${card}`}>
+                <RefreshCw className="w-4 h-4 text-indigo-400 animate-spin" />
+                <span>Loading full technicals, valuation ratios, insider transactions &amp; news for {selectedSymbol}...</span>
+              </div>
+            )}
+
+            {deepError && !deepLoading && (
+              <div className="p-4 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-300 text-xs space-y-1">
+                <p className="font-bold">Could not load "{selectedSymbol}"</p>
+                <p>{deepError}</p>
+              </div>
+            )}
+
+            {deepDetail && !deepLoading && (
+              <>
+                {/* Top KPI Cards */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                  <div className={`p-3 rounded-xl border ${card}`}>
+                    <div className={`text-[11px] ${subText}`}>Last Price</div>
+                    <div className="text-base font-mono font-bold mt-0.5">
+                      {deepDetail.currency}{Number(deepDetail.price || 0).toLocaleString()}
                     </div>
-                    <div className={`w-full h-2 rounded-full overflow-hidden ${dark ? 'bg-slate-800' : 'bg-slate-200'}`}>
-                      <div
-                        className={`h-full rounded-full ${
-                          val >= 60 ? 'bg-emerald-500' : val >= 38 && val <= 43 ? 'bg-amber-400' : val < 38 ? 'bg-rose-500' : 'bg-indigo-400'
-                        }`}
-                        style={{ width: `${Math.min(100, Math.max(0, val))}%` }}
-                      />
+                    <div className={`text-xs font-mono font-semibold ${deepDetail.changePct >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {deepDetail.changePct >= 0 ? '+' : ''}{Number(deepDetail.changePct || 0).toFixed(2)}%
                     </div>
                   </div>
-                );
-              })}
-            </div>
+                  <div className={`p-3 rounded-xl border ${card}`}>
+                    <div className={`text-[11px] ${subText}`}>Market Cap</div>
+                    <div className="text-base font-mono font-bold mt-0.5">
+                      {formatMoneyCompact(deepDetail.fundamentals?.marketCap, deepDetail.currency)}
+                    </div>
+                    <div className={`text-[11px] ${subText}`}>
+                      Beta: {formatNum(deepDetail.fundamentals?.beta)}
+                    </div>
+                  </div>
+                  <div className={`p-3 rounded-xl border ${card}`}>
+                    <div className={`text-[11px] ${subText}`}>Relative Volume</div>
+                    <div className="text-base font-mono font-bold text-cyan-400 mt-0.5">
+                      {Number(deepDetail.rvol || 0).toFixed(2)}x
+                    </div>
+                    <div className={`text-[11px] ${subText}`}>Vol {formatVolume(deepDetail.volume)}</div>
+                  </div>
+                  <div className={`p-3 rounded-xl border ${card}`}>
+                    <div className={`text-[11px] ${subText}`}>Analyst Target</div>
+                    <div className="text-base font-mono font-bold mt-0.5">
+                      {deepDetail.fundamentals?.targetMeanPrice
+                        ? `${deepDetail.currency}${deepDetail.fundamentals.targetMeanPrice.toLocaleString()}`
+                        : '—'}
+                    </div>
+                    <div className="text-[11px] uppercase font-semibold text-indigo-400">
+                      {deepDetail.fundamentals?.recommendationKey || 'N/A'}
+                    </div>
+                  </div>
+                </div>
 
-            {/* Daily EMA / SMA Price Ladder */}
-            <div className={`p-3.5 rounded-xl border space-y-2 ${card}`}>
-              <h3 className="text-xs font-bold">Daily EMA / SMA Distance Ladder</h3>
-              <div className="grid grid-cols-2 gap-2">
-                {MA_OPTIONS.map((m) => {
-                  const maVal = selectedStock.ma.D[m.key];
-                  const distPct = maVal ? ((selectedStock.price - maVal) / maVal) * 100 : 0;
-                  const above = distPct >= 0;
-                  return (
-                    <div
-                      key={m.key}
-                      className={`p-2.5 rounded-xl border flex items-center justify-between text-xs ${
-                        dark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'
+                {/* Section Tabs */}
+                <div className={`flex items-center gap-1.5 overflow-x-auto pb-1 border-b ${dark ? 'border-slate-800' : 'border-slate-200'}`}>
+                  {[
+                    { id: 'overview', label: 'Overview & Chart' },
+                    { id: 'technicals', label: 'Technicals' },
+                    { id: 'fundamentals', label: 'Fundamentals' },
+                    { id: 'insiders', label: 'Insiders & Ownership' },
+                    { id: 'news', label: `News (${deepDetail.news?.length || 0})` },
+                  ].map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setDrawerTab(tab.id)}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
+                        drawerTab === tab.id
+                          ? 'bg-indigo-600 text-white'
+                          : dark
+                          ? 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                          : 'text-slate-600 hover:bg-slate-100'
                       }`}
                     >
-                      <div>
-                        <div className="font-semibold">{m.label}</div>
-                        <div className={`font-mono text-[11px] ${subText}`}>
-                          {currentData.currency}{maVal.toLocaleString()}
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* TAB 1: Overview & Price Chart */}
+                {drawerTab === 'overview' && (
+                  <div className="space-y-3">
+                    <div className={`p-3.5 rounded-xl border ${card}`}>
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-xs font-bold">Recent Price Action vs Daily EMA 20</span>
+                        {deepDetail.fundamentals?.fiftyTwoWeekLow && deepDetail.fundamentals?.fiftyTwoWeekHigh && (
+                          <span className={`text-[11px] font-mono ${subText}`}>
+                            52W: {deepDetail.currency}{deepDetail.fundamentals.fiftyTwoWeekLow} – {deepDetail.currency}{deepDetail.fundamentals.fiftyTwoWeekHigh}
+                          </span>
+                        )}
+                      </div>
+                      <div className="relative h-52 w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <ComposedChart
+                            data={(deepDetail.chart || []).map((pt) => ({
+                              date: pt.date,
+                              price: pt.close,
+                              ema20: deepDetail.ma?.D?.ema20,
+                            }))}
+                            margin={{ top: 8, right: 8, left: -12, bottom: 0 }}
+                          >
+                            <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} minTickGap={24} />
+                            <YAxis domain={['auto', 'auto']} tick={{ fontSize: 10, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+                            <Tooltip
+                              contentStyle={{
+                                backgroundColor: dark ? '#0f172a' : '#ffffff',
+                                borderColor: dark ? '#334155' : '#e2e8f0',
+                                borderRadius: '10px',
+                                fontSize: '12px',
+                              }}
+                            />
+                            <Area type="monotone" dataKey="price" stroke="#6366f1" strokeWidth={2} fill="#6366f1" fillOpacity={0.18} isAnimationActive={false} />
+                            <Line type="monotone" dataKey="ema20" stroke="#f59e0b" strokeDasharray="4 4" dot={false} strokeWidth={1.5} isAnimationActive={false} />
+                          </ComposedChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+
+                    {deepDetail.summary && (
+                      <div className={`p-3.5 rounded-xl border space-y-1.5 ${card}`}>
+                        <h3 className="text-xs font-bold">Business Profile</h3>
+                        <p className={`text-xs leading-relaxed ${subText}`}>{deepDetail.summary}</p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* TAB 2: Multi-TF Technicals */}
+                {drawerTab === 'technicals' && (
+                  <div className="space-y-3">
+                    <div className={`p-3.5 rounded-xl border space-y-2.5 ${card}`}>
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-xs font-bold">Multi-Timeframe RSI (14)</h3>
+                        {deepDetail.atr14 && (
+                          <span className={`text-[11px] font-mono ${subText}`}>
+                            Daily ATR(14): {deepDetail.currency}{deepDetail.atr14}
+                          </span>
+                        )}
+                      </div>
+                      {TIMEFRAMES.map((tf) => {
+                        const val = deepDetail.rsi?.[tf.key] ?? 50;
+                        return (
+                          <div key={tf.key} className="space-y-1">
+                            <div className="flex justify-between text-xs">
+                              <span className="font-medium">{tf.label}</span>
+                              <span className="font-mono font-bold">{Number(val).toFixed(1)}</span>
+                            </div>
+                            <div className={`w-full h-2 rounded-full overflow-hidden ${dark ? 'bg-slate-800' : 'bg-slate-200'}`}>
+                              <div
+                                className={`h-full rounded-full ${
+                                  val >= 60 ? 'bg-emerald-500' : val >= 38 && val <= 43 ? 'bg-amber-400' : val < 38 ? 'bg-rose-500' : 'bg-indigo-400'
+                                }`}
+                                style={{ width: `${Math.min(100, Math.max(0, val))}%` }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    <div className={`p-3.5 rounded-xl border space-y-2 ${card}`}>
+                      <h3 className="text-xs font-bold">Daily EMA / SMA Distance Ladder</h3>
+                      <div className="grid grid-cols-2 gap-2">
+                        {MA_OPTIONS.map((m) => {
+                          const maVal = deepDetail.ma?.D?.[m.key];
+                          const distPct = maVal ? ((deepDetail.price - maVal) / maVal) * 100 : 0;
+                          const above = distPct >= 0;
+                          return (
+                            <div
+                              key={m.key}
+                              className={`p-2.5 rounded-xl border flex items-center justify-between text-xs ${
+                                dark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'
+                              }`}
+                            >
+                              <div>
+                                <div className="font-semibold">{m.label}</div>
+                                <div className={`font-mono text-[11px] ${subText}`}>
+                                  {maVal ? `${deepDetail.currency}${maVal.toLocaleString()}` : '—'}
+                                </div>
+                              </div>
+                              <span className={`font-mono font-semibold text-xs ${above ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {maVal ? `${above ? '+' : ''}${distPct.toFixed(1)}%` : '—'}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* TAB 3: Fundamentals & Valuation */}
+                {drawerTab === 'fundamentals' && (
+                  <div className={`p-3.5 rounded-xl border ${card}`}>
+                    <h3 className="text-xs font-bold mb-3">Valuation, Profitability &amp; Balance Sheet</h3>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 text-xs">
+                      {[
+                        { label: 'Trailing P/E', val: formatNum(deepDetail.fundamentals?.trailingPE) },
+                        { label: 'Forward P/E', val: formatNum(deepDetail.fundamentals?.forwardPE) },
+                        { label: 'PEG Ratio', val: formatNum(deepDetail.fundamentals?.pegRatio) },
+                        { label: 'Price / Book', val: formatNum(deepDetail.fundamentals?.priceToBook) },
+                        { label: 'Price / Sales', val: formatNum(deepDetail.fundamentals?.priceToSales) },
+                        { label: 'EV / EBITDA', val: formatNum(deepDetail.fundamentals?.evToEbitda) },
+                        { label: 'EPS (TTM)', val: formatNum(deepDetail.fundamentals?.epsTrailing) },
+                        { label: 'EPS (Fwd)', val: formatNum(deepDetail.fundamentals?.epsForward) },
+                        { label: 'ROE', val: formatPctRatio(deepDetail.fundamentals?.roe) },
+                        { label: 'ROA', val: formatPctRatio(deepDetail.fundamentals?.roa) },
+                        { label: 'Profit Margin', val: formatPctRatio(deepDetail.fundamentals?.profitMargin) },
+                        { label: 'Operating Margin', val: formatPctRatio(deepDetail.fundamentals?.operatingMargin) },
+                        { label: 'Revenue Growth', val: formatPctRatio(deepDetail.fundamentals?.revenueGrowth) },
+                        { label: 'Earnings Growth', val: formatPctRatio(deepDetail.fundamentals?.earningsGrowth) },
+                        { label: 'Debt / Equity', val: formatNum(deepDetail.fundamentals?.debtToEquity) },
+                        { label: 'Current Ratio', val: formatNum(deepDetail.fundamentals?.currentRatio) },
+                        { label: 'Free Cash Flow', val: formatMoneyCompact(deepDetail.fundamentals?.freeCashflow, deepDetail.currency) },
+                        { label: 'Dividend Yield', val: formatPctRatio(deepDetail.fundamentals?.dividendYield) },
+                      ].map((item) => (
+                        <div key={item.label} className={`p-2.5 rounded-xl border ${dark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                          <div className={`text-[11px] ${subText}`}>{item.label}</div>
+                          <div className="font-mono font-bold mt-0.5">{item.val}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* TAB 4: Insiders & Ownership */}
+                {drawerTab === 'insiders' && (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                      {[
+                        { label: 'Insider Held', val: formatPctRatio(deepDetail.ownership?.heldPercentInsiders) },
+                        { label: 'Institutions Held', val: formatPctRatio(deepDetail.ownership?.heldPercentInstitutions) },
+                        { label: 'Short Ratio', val: formatNum(deepDetail.ownership?.shortRatio) },
+                        { label: 'Short % Float', val: formatPctRatio(deepDetail.ownership?.shortPercentOfFloat) },
+                      ].map((o) => (
+                        <div key={o.label} className={`p-2.5 rounded-xl border ${card}`}>
+                          <div className={`text-[11px] ${subText}`}>{o.label}</div>
+                          <div className="font-mono font-bold mt-0.5">{o.val}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className={`p-3.5 rounded-xl border space-y-2 ${card}`}>
+                      <h3 className="text-xs font-bold">Recent Insider Transactions</h3>
+                      {(deepDetail.ownership?.insiderTransactions || []).length === 0 ? (
+                        <p className={`text-xs ${subText}`}>No recent insider transactions reported for this ticker on Yahoo Finance.</p>
+                      ) : (
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left text-[11px]">
+                            <thead>
+                              <tr className={`border-b ${dark ? 'border-slate-800 text-slate-400' : 'border-slate-200 text-slate-500'}`}>
+                                <th className="py-1.5 pr-2">Insider</th>
+                                <th className="py-1.5 pr-2">Type</th>
+                                <th className="py-1.5 pr-2 text-right">Shares</th>
+                                <th className="py-1.5 text-right">Date</th>
+                              </tr>
+                            </thead>
+                            <tbody className={`divide-y ${dark ? 'divide-slate-800/60' : 'divide-slate-200'}`}>
+                              {deepDetail.ownership.insiderTransactions.map((tx, idx) => (
+                                <tr key={idx}>
+                                  <td className="py-1.5 pr-2">
+                                    <div className="font-semibold">{tx.Insider || tx.Text || 'Insider'}</div>
+                                    <div className={`text-[10px] ${subText}`}>{tx.Position || ''}</div>
+                                  </td>
+                                  <td className="py-1.5 pr-2">{tx.Transaction || '—'}</td>
+                                  <td className="py-1.5 pr-2 text-right font-mono">{tx.Shares ? Number(tx.Shares).toLocaleString() : '—'}</td>
+                                  <td className="py-1.5 text-right font-mono">{tx['Start Date'] || tx.index || '—'}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+
+                    {(deepDetail.ownership?.institutionalHolders || []).length > 0 && (
+                      <div className={`p-3.5 rounded-xl border space-y-2 ${card}`}>
+                        <h3 className="text-xs font-bold">Top Institutional Holders</h3>
+                        <div className="space-y-1.5 text-xs">
+                          {deepDetail.ownership.institutionalHolders.map((h, idx) => (
+                            <div key={idx} className="flex items-center justify-between">
+                              <span className="truncate pr-3">{h.Holder || 'Institution'}</span>
+                              <span className="font-mono font-semibold shrink-0">
+                                {h.pctHeld ? formatPctRatio(h.pctHeld) : h.Shares ? Number(h.Shares).toLocaleString() : '—'}
+                              </span>
+                            </div>
+                          ))}
                         </div>
                       </div>
-                      <span className={`font-mono font-semibold text-xs ${above ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {above ? '+' : ''}{distPct.toFixed(1)}%
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+                    )}
+                  </div>
+                )}
+
+                {/* TAB 5: News */}
+                {drawerTab === 'news' && (
+                  <div className={`p-3.5 rounded-xl border space-y-2.5 ${card}`}>
+                    <h3 className="text-xs font-bold">Latest Headlines</h3>
+                    {(deepDetail.news || []).length === 0 ? (
+                      <p className={`text-xs ${subText}`}>No recent headlines available for this ticker.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {deepDetail.news.map((n, idx) => (
+                          <a
+                            key={idx}
+                            href={n.link || '#'}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className={`block p-2.5 rounded-xl border transition-colors ${
+                              dark ? 'bg-slate-950 border-slate-800 hover:border-indigo-500' : 'bg-slate-50 border-slate-200 hover:border-indigo-400'
+                            }`}
+                          >
+                            <div className="text-xs font-semibold leading-snug">{n.title}</div>
+                            {n.publisher && <div className={`text-[10px] mt-1 ${subText}`}>{n.publisher}</div>}
+                          </a>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </div>
       )}
