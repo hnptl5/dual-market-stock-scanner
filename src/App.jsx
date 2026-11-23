@@ -68,6 +68,7 @@ const INITIAL_DATASETS = {
     stocks: [
       {
         symbol: 'NVDA',
+        pattern: 'Bull Engulfing',
         tvSymbol: 'NASDAQ:NVDA',
         name: 'NVIDIA Corp.',
         sector: 'Semiconductors',
@@ -88,6 +89,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'MSFT',
+        pattern: 'Bull Pin Bar',
         tvSymbol: 'NASDAQ:MSFT',
         name: 'Microsoft Corp.',
         sector: 'Software',
@@ -148,6 +150,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'NFLX',
+        pattern: 'Bull Pin Bar',
         tvSymbol: 'NASDAQ:NFLX',
         name: 'Netflix Inc.',
         sector: 'Communication',
@@ -328,6 +331,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'INTC',
+        pattern: 'Bear Pin Bar',
         tvSymbol: 'NASDAQ:INTC',
         name: 'Intel Corp.',
         sector: 'Semiconductors',
@@ -368,6 +372,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'COST',
+        pattern: 'Inside Bar',
         tvSymbol: 'NASDAQ:COST',
         name: 'Costco Wholesale',
         sector: 'Consumer Staples',
@@ -408,6 +413,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'NKE',
+        pattern: 'Bear Engulfing',
         tvSymbol: 'NYSE:NKE',
         name: 'Nike Inc.',
         sector: 'Consumer Discretionary',
@@ -494,6 +500,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'ICICIBANK',
+        pattern: 'Bull Pin Bar',
         tvSymbol: 'NSE:ICICIBANK',
         name: 'ICICI Bank Ltd.',
         sector: 'Banking',
@@ -514,6 +521,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'BHARTIARTL',
+        pattern: 'Bull Pin Bar',
         tvSymbol: 'NSE:BHARTIARTL',
         name: 'Bharti Airtel Ltd.',
         sector: 'Telecom',
@@ -534,6 +542,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'BEL',
+        pattern: 'Bull Engulfing',
         tvSymbol: 'NSE:BEL',
         name: 'Bharat Electronics',
         sector: 'Defence',
@@ -574,6 +583,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'M&M',
+        pattern: 'Inside Bar',
         tvSymbol: 'NSE:M_M',
         name: 'Mahindra & Mahindra',
         sector: 'Auto',
@@ -674,6 +684,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'TATAMOTORS',
+        pattern: 'Bear Engulfing',
         tvSymbol: 'NSE:TATAMOTORS',
         name: 'Tata Motors Ltd.',
         sector: 'Auto',
@@ -714,6 +725,7 @@ const INITIAL_DATASETS = {
       },
       {
         symbol: 'INDUSINDBK',
+        pattern: 'Bear Pin Bar',
         tvSymbol: 'NSE:INDUSINDBK',
         name: 'IndusInd Bank Ltd.',
         sector: 'Banking',
@@ -802,10 +814,19 @@ const MA_CONDITIONS = [
   { key: 'bearish_stack', label: 'Bearish Stack (P < 20E < 50E < 200S)', needsMa: false },
 ];
 
+const PATTERN_OPTIONS = [
+  'Bull Pin Bar',
+  'Bear Pin Bar',
+  'Bull Engulfing',
+  'Bear Engulfing',
+  'Inside Bar',
+];
+
 const DEFAULT_FILTERS = {
   search: '',
   universe: 'ALL',
   sector: 'ALL',
+  pattern: 'ALL', // ALL | ANY_SIGNAL | specific pattern
   minRvol: '',
   maxRvol: '',
   rsMode: 'ALL', // ALL | OUTPERFORM | STRONG_LEADER | UNDERPERFORM
@@ -991,6 +1012,17 @@ function getRsiBadgeClass(val, dark) {
   return dark ? 'bg-slate-800 text-slate-300 border-slate-700' : 'bg-slate-100 text-slate-700 border-slate-200';
 }
 
+function getPatternBadgeClass(pattern, dark) {
+  if (!pattern) return '';
+  if (pattern.startsWith('Bull')) {
+    return dark ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30' : 'bg-emerald-50 text-emerald-700 border-emerald-200';
+  }
+  if (pattern.startsWith('Bear')) {
+    return dark ? 'bg-rose-500/15 text-rose-300 border-rose-500/30' : 'bg-rose-50 text-rose-700 border-rose-200';
+  }
+  return dark ? 'bg-amber-500/15 text-amber-300 border-amber-500/30' : 'bg-amber-50 text-amber-700 border-amber-200';
+}
+
 export default function App() {
   const [dark, setDark] = useState(true);
   const [market, setMarket] = useState('IN');
@@ -998,7 +1030,10 @@ export default function App() {
   const [liveRunning, setLiveRunning] = useState(true);
   const [refreshIntervalSec, setRefreshIntervalSec] = useState(60); // 60s, 300s, 900s, or 3s demo
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshElapsed, setRefreshElapsed] = useState(0);
   const [apiConnected, setApiConnected] = useState(false);
+  const [customTickers, setCustomTickers] = useState({ US: [], IN: [] });
+  const [customTickerInput, setCustomTickerInput] = useState('');
   const [datasets, setDatasets] = useState(INITIAL_DATASETS);
   const [filters, setFilters] = useState(DEFAULT_FILTERS);
   const [activePresetId, setActivePresetId] = useState('all');
@@ -1029,10 +1064,30 @@ export default function App() {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed)) setCustomPresets(parsed);
       }
+      const savedTickers = localStorage.getItem('pulsescan_custom_tickers_v1');
+      if (savedTickers) {
+        const parsedT = JSON.parse(savedTickers);
+        if (parsedT && Array.isArray(parsedT.US) && Array.isArray(parsedT.IN)) {
+          setCustomTickers(parsedT);
+        }
+      }
     } catch {
       // Ignore storage restrictions
     }
   }, []);
+
+  // Track elapsed seconds while scanning full market
+  useEffect(() => {
+    if (!isRefreshing) {
+      setRefreshElapsed(0);
+      return undefined;
+    }
+    const started = Date.now();
+    const t = setInterval(() => {
+      setRefreshElapsed(Math.floor((Date.now() - started) / 1000));
+    }, 500);
+    return () => clearInterval(t);
+  }, [isRefreshing]);
 
   // Update market clock
   useEffect(() => {
@@ -1087,10 +1142,12 @@ export default function App() {
     });
   };
 
-  const fetchMarketData = async (targetMarket, forceFresh = false, silent = false) => {
+  const fetchMarketData = async (targetMarket, forceFresh = false, silent = false, customListOverride = null) => {
     setIsRefreshing(true);
     try {
-      const url = `/api/scan?market=${targetMarket}${forceFresh ? '&fresh=1' : ''}`;
+      const activeCustom = customListOverride !== null ? customListOverride : (customTickers[targetMarket] || []);
+      const customParam = activeCustom.length > 0 ? `&custom=${encodeURIComponent(activeCustom.join(','))}` : '';
+      const url = `/api/scan?market=${targetMarket}${forceFresh ? '&fresh=1' : ''}${customParam}`;
       const res = await fetch(url, { cache: forceFresh ? 'no-store' : 'default' });
       const contentType = res.headers.get('content-type') || '';
       if (!res.ok || !contentType.includes('application/json')) {
@@ -1182,6 +1239,12 @@ export default function App() {
       if (filters.sector !== 'ALL' && s.sector !== filters.sector) {
         return false;
       }
+      if (filters.pattern === 'ANY_SIGNAL' && !s.pattern) {
+        return false;
+      }
+      if (filters.pattern !== 'ALL' && filters.pattern !== 'ANY_SIGNAL' && s.pattern !== filters.pattern) {
+        return false;
+      }
       if (minRvol !== null && Number.isFinite(minRvol) && s.rvol < minRvol) return false;
       if (maxRvol !== null && Number.isFinite(maxRvol) && s.rvol > maxRvol) return false;
 
@@ -1264,7 +1327,81 @@ export default function App() {
   const switchMarket = (nextMarket) => {
     setMarket(nextMarket);
     setSelectedSymbol(null);
-    setFilters((f) => ({ ...f, universe: 'ALL', sector: 'ALL' }));
+    setFilters((f) => ({ ...f, search: '', universe: 'ALL', sector: 'ALL', pattern: 'ALL' }));
+  };
+
+  const handleAddCustomTicker = (e) => {
+    e.preventDefault();
+    const cleaned = customTickerInput.trim().toUpperCase().replace(/[^A-Z0-9.&_-]/g, '');
+    if (!cleaned) return;
+    const baseSym = market === 'IN' ? cleaned.replace(/\.(NS|BO)$/, '') : cleaned;
+    const existing = customTickers[market] || [];
+    if (existing.includes(baseSym)) {
+      showToast(`${baseSym} is already in your custom list`);
+      setCustomTickerInput('');
+      return;
+    }
+    const nextList = [...existing, baseSym].slice(0, 15);
+    const nextMap = { ...customTickers, [market]: nextList };
+    setCustomTickers(nextMap);
+    setCustomTickerInput('');
+    try {
+      localStorage.setItem('pulsescan_custom_tickers_v1', JSON.stringify(nextMap));
+    } catch {
+      // Ignore storage error
+    }
+    // If running in preview without live API, insert a sample entry so the user can test immediately
+    if (!apiConnected) {
+      setDatasets((prev) => {
+        const cur = prev[market];
+        if (cur.stocks.some((s) => s.symbol === baseSym)) return prev;
+        const basePrice = market === 'US' ? 125.4 : 1480.5;
+        const sampleStock = {
+          symbol: baseSym,
+          tvSymbol: market === 'IN' ? `NSE:${baseSym.replace('&', '_')}` : baseSym,
+          name: `${baseSym} (Custom)`,
+          sector: 'Custom Watchlist',
+          universe: ['Custom'],
+          price: basePrice,
+          changePct: 1.45,
+          volume: 3250000,
+          avgVolume20: 2100000,
+          rvol: 1.55,
+          pattern: 'Bull Pin Bar',
+          rsi: { '1H': 58.2, D: 41.5, W: 62.4, M: 65.1 },
+          ma: {
+            '1H': { ema9: basePrice * 0.995, ema20: basePrice * 0.99, ema50: basePrice * 0.98, sma50: basePrice * 0.978, sma100: basePrice * 0.96, sma200: basePrice * 0.94 },
+            D: { ema9: basePrice * 0.992, ema20: basePrice * 0.985, ema50: basePrice * 0.96, sma50: basePrice * 0.958, sma100: basePrice * 0.93, sma200: basePrice * 0.89 },
+            W: { ema9: basePrice * 0.97, ema20: basePrice * 0.94, ema50: basePrice * 0.88, sma50: basePrice * 0.875, sma100: basePrice * 0.80, sma200: basePrice * 0.72 },
+            M: { ema9: basePrice * 0.92, ema20: basePrice * 0.85, ema50: basePrice * 0.74, sma50: basePrice * 0.73, sma100: basePrice * 0.62, sma200: basePrice * 0.50 },
+          },
+          history: Array.from({ length: 12 }, (_, i) => Number((basePrice * (0.94 + i * 0.0055)).toFixed(2))),
+        };
+        return {
+          ...prev,
+          [market]: { ...cur, stocks: [sampleStock, ...cur.stocks] },
+        };
+      });
+    }
+    fetchMarketData(market, true, false, nextList);
+  };
+
+  const handleRemoveCustomTicker = (sym) => {
+    const nextList = (customTickers[market] || []).filter((t) => t !== sym);
+    const nextMap = { ...customTickers, [market]: nextList };
+    setCustomTickers(nextMap);
+    try {
+      localStorage.setItem('pulsescan_custom_tickers_v1', JSON.stringify(nextMap));
+    } catch {
+      // Ignore storage error
+    }
+    setDatasets((prev) => ({
+      ...prev,
+      [market]: {
+        ...prev[market],
+        stocks: prev[market].stocks.filter((s) => !(s.symbol === sym && s.sector === 'Custom Watchlist')),
+      },
+    }));
   };
 
   const applyPreset = (preset) => {
@@ -1419,6 +1556,7 @@ export default function App() {
       'D_EMA20',
       'D_EMA50',
       'D_SMA200',
+      'Pattern',
       'Volume',
     ];
     const rows = filteredStocks.map((s) => [
@@ -1436,6 +1574,7 @@ export default function App() {
       s.ma.D.ema20,
       s.ma.D.ema50,
       s.ma.D.sma200,
+      `"${s.pattern || ''}"`,
       s.volume,
     ]);
     const csv = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
@@ -1510,6 +1649,7 @@ export default function App() {
     let c = 0;
     if (filters.universe !== 'ALL') c++;
     if (filters.sector !== 'ALL') c++;
+    if (filters.pattern !== 'ALL') c++;
     if (filters.minRvol !== '' || filters.maxRvol !== '') c++;
     if (filters.rsMode !== 'ALL') c++;
     TIMEFRAMES.forEach((tf) => {
@@ -1756,7 +1896,9 @@ export default function App() {
                   }`}>
                     {currentData.benchmark.changePct >= 0 ? '+' : ''}{currentData.benchmark.changePct}%
                   </span>
-                  <span className={`text-xs ${subText}`}>• RVOL {currentData.benchmark.rvol}x</span>
+                  {currentData.benchmark.rvol > 0 && (
+                    <span className={`text-xs ${subText}`}>• RVOL {currentData.benchmark.rvol}x</span>
+                  )}
                 </div>
               </div>
             </div>
@@ -1808,7 +1950,7 @@ export default function App() {
         </section>
 
         {/* Quick Strategy Presets Bar */}
-        <section className="flex items-center gap-2 overflow-x-auto pb-1">
+        <section className="flex flex-wrap items-center gap-2">
           <div className={`flex items-center gap-1.5 text-xs font-semibold shrink-0 mr-1 ${subText}`}>
             <Sparkles className="w-3.5 h-3.5 text-amber-400" />
             Presets:
@@ -1952,6 +2094,70 @@ export default function App() {
                     </select>
                   </div>
                 </div>
+
+                {/* Candlestick Pattern Filter */}
+                <div>
+                  <label className={`block text-[11px] font-medium mb-1 ${subText}`}>Daily Candlestick Signal</label>
+                  <select
+                    value={filters.pattern}
+                    onChange={(e) => {
+                      setActivePresetId('custom');
+                      setFilters((f) => ({ ...f, pattern: e.target.value }));
+                    }}
+                    className={`w-full px-2.5 py-1.5 rounded-lg border text-xs outline-none ${inputCls}`}
+                  >
+                    <option value="ALL">All Stocks</option>
+                    <option value="ANY_SIGNAL">Any Pattern Signal</option>
+                    {PATTERN_OPTIONS.map((pat) => (
+                      <option key={pat} value={pat}>{pat}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Custom On-Demand Ticker Scanner */}
+                <form onSubmit={handleAddCustomTicker} className="space-y-1.5 pt-1">
+                  <label className={`block text-[11px] font-medium ${subText}`}>
+                    Scan Custom {market === 'US' ? 'US' : 'NSE'} Ticker
+                  </label>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      value={customTickerInput}
+                      onChange={(e) => setCustomTickerInput(e.target.value)}
+                      placeholder={market === 'US' ? 'e.g. SMCI, SHOP' : 'e.g. DIXON, COFORGE'}
+                      className={`flex-1 px-2.5 py-1.5 rounded-lg border text-xs font-mono uppercase outline-none ${inputCls}`}
+                    />
+                    <button
+                      type="submit"
+                      className="px-2.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold flex items-center gap-1 shrink-0"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      Add
+                    </button>
+                  </div>
+                  {(customTickers[market] || []).length > 0 && (
+                    <div className="flex flex-wrap gap-1 pt-0.5">
+                      {(customTickers[market] || []).map((sym) => (
+                        <span
+                          key={sym}
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-mono font-semibold border ${
+                            dark ? 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300' : 'bg-indigo-50 border-indigo-200 text-indigo-700'
+                          }`}
+                        >
+                          {sym}
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveCustomTicker(sym)}
+                            className="hover:text-rose-400"
+                            aria-label={`Remove ${sym}`}
+                          >
+                            <X className="w-2.5 h-2.5" />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </form>
               </div>
 
               {/* Relative Volume & Market Strength */}
@@ -2130,7 +2336,36 @@ export default function App() {
 
           {/* Right Results Table */}
           <main className="lg:col-span-8 xl:col-span-9 space-y-3">
-            <div className={`rounded-2xl border overflow-hidden ${card}`}>
+            {/* Live Processing / Fetching Loader Banner */}
+            {isRefreshing && (
+              <div
+                role="status"
+                aria-live="polite"
+                className={`rounded-2xl border p-3.5 flex flex-col gap-2 ${
+                  dark ? 'bg-indigo-950/40 border-indigo-500/30 text-indigo-100' : 'bg-indigo-50 border-indigo-200 text-indigo-900'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2.5 text-xs font-semibold">
+                    <RefreshCw className="w-4 h-4 text-indigo-400 animate-spin shrink-0" />
+                    <span>
+                      Scanning full {market === 'US' ? 'US (S&P 500 / NASDAQ 100 — ~193 stocks)' : 'India (NIFTY 50 / NSE F&O — ~191 stocks)'} universe — fetching multi-timeframe RSI, EMA/SMA, RVOL &amp; signals...
+                    </span>
+                  </div>
+                  <span className="text-xs font-mono font-bold text-indigo-400 shrink-0">
+                    {refreshElapsed}s
+                  </span>
+                </div>
+                <div className={`w-full h-1.5 rounded-full overflow-hidden ${dark ? 'bg-slate-800' : 'bg-indigo-100'}`}>
+                  <div
+                    className="h-full bg-gradient-to-r from-indigo-500 via-cyan-400 to-indigo-500 rounded-full transition-all duration-500"
+                    style={{ width: `${Math.min(92, 18 + refreshElapsed * 3)}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className={`rounded-2xl border overflow-hidden transition-opacity duration-200 ${card} ${isRefreshing ? 'opacity-70' : 'opacity-100'}`}>
               {/* Table Header Strip */}
               <div className={`px-4 py-3 border-b flex flex-wrap items-center justify-between gap-2 ${dark ? 'border-slate-800' : 'border-slate-200'}`}>
                 <div className="flex items-center gap-2">
@@ -2185,13 +2420,14 @@ export default function App() {
                           </button>
                         </div>
                       </th>
-                      <th className="py-3 px-4">Daily MA Stack</th>
+                      <th className="py-3 px-3">Daily MA Stack</th>
+                      <th className="py-3 px-4">Signal</th>
                     </tr>
                   </thead>
                   <tbody className={`divide-y text-xs ${dark ? 'divide-slate-800/70' : 'divide-slate-200'}`}>
                     {filteredStocks.length === 0 ? (
                       <tr>
-                        <td colSpan={7} className="py-12 text-center">
+                        <td colSpan={8} className="py-12 text-center">
                           <p className="text-sm font-semibold mb-1">No stocks match your current filters</p>
                           <p className={`text-xs mb-3 ${subText}`}>Try widening your RSI range, lowering Min RVOL, or resetting MA rules.</p>
                           <button
@@ -2250,8 +2486,15 @@ export default function App() {
 
                             {/* RVOL */}
                             <td className="py-3 px-3 min-w-[110px]">
-                              <div className="flex items-center justify-between font-mono font-semibold mb-1">
-                                <span className={stock.rvol >= 1.5 ? 'text-cyan-400' : ''}>{stock.rvol.toFixed(2)}x</span>
+                              <div className="flex items-center justify-between font-mono font-semibold mb-1 gap-1">
+                                <span className={`inline-flex items-center gap-1 ${stock.rvol >= 1.5 ? 'text-cyan-400' : ''}`}>
+                                  {stock.rvol.toFixed(2)}x
+                                  {stock.rvolPaceAdjusted && (
+                                    <span title="Normalized for intraday elapsed session time" className="px-1 py-0.2 rounded text-[9px] bg-cyan-500/15 text-cyan-300 font-sans">
+                                      Pace
+                                    </span>
+                                  )}
+                                </span>
                                 <span className={`text-[10px] font-normal ${subText}`}>{formatVolume(stock.volume)}</span>
                               </div>
                               <div className={`w-full h-1.5 rounded-full overflow-hidden ${dark ? 'bg-slate-800' : 'bg-slate-200'}`}>
@@ -2286,8 +2529,8 @@ export default function App() {
                             </td>
 
                             {/* Daily MA Alignment */}
-                            <td className="py-3 px-4">
-                              <div className="flex items-center gap-1">
+                            <td className="py-3 px-3">
+                              <div className="flex items-center gap-1 whitespace-nowrap">
                                 {[
                                   { label: '20E', ok: stock.above20 },
                                   { label: '50E', ok: stock.above50 },
@@ -2295,7 +2538,7 @@ export default function App() {
                                 ].map((m) => (
                                   <span
                                     key={m.label}
-                                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold ${
+                                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold shrink-0 ${
                                       m.ok
                                         ? 'bg-emerald-500/15 text-emerald-400'
                                         : 'bg-rose-500/15 text-rose-400'
@@ -2305,11 +2548,27 @@ export default function App() {
                                   </span>
                                 ))}
                                 {stock.bullishStack && (
-                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/20 text-indigo-300">
+                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-indigo-500/20 text-indigo-300 whitespace-nowrap shrink-0">
                                     Stack ↑
                                   </span>
                                 )}
+                                {stock.bearishStack && (
+                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-rose-500/20 text-rose-300 whitespace-nowrap shrink-0">
+                                    Stack ↓
+                                  </span>
+                                )}
                               </div>
+                            </td>
+
+                            {/* Daily Candlestick Signal */}
+                            <td className="py-3 px-4 whitespace-nowrap">
+                              {stock.pattern ? (
+                                <span className={`inline-block px-2 py-0.5 rounded-md border text-[10px] font-semibold whitespace-nowrap ${getPatternBadgeClass(stock.pattern, dark)}`}>
+                                  {stock.pattern}
+                                </span>
+                              ) : (
+                                <span className={`text-[11px] ${subText}`}>—</span>
+                              )}
                             </td>
                           </tr>
                         );
@@ -2339,6 +2598,11 @@ export default function App() {
                   <span className={`text-xs px-2 py-0.5 rounded-md font-medium ${dark ? 'bg-slate-800 text-slate-300' : 'bg-slate-100 text-slate-600'}`}>
                     {currentData.exchange} • {selectedStock.sector}
                   </span>
+                  {selectedStock.pattern && (
+                    <span className={`text-[11px] px-2 py-0.5 rounded-md border font-semibold whitespace-nowrap ${getPatternBadgeClass(selectedStock.pattern, dark)}`}>
+                      {selectedStock.pattern}
+                    </span>
+                  )}
                 </div>
                 <p className={`text-xs mt-0.5 ${subText}`}>{selectedStock.name}</p>
               </div>
@@ -2420,6 +2684,7 @@ export default function App() {
                       strokeWidth={2}
                       fill="#6366f1"
                       fillOpacity={0.18}
+                      isAnimationActive={false}
                     />
                     <Line
                       type="monotone"
@@ -2428,6 +2693,7 @@ export default function App() {
                       strokeDasharray="4 4"
                       dot={false}
                       strokeWidth={1.5}
+                      isAnimationActive={false}
                     />
                   </ComposedChart>
                 </ResponsiveContainer>

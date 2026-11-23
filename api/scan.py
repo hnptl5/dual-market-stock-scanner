@@ -1,73 +1,44 @@
 """
-Vercel Serverless Function: /api/scan
+Vercel Serverless Function: /api/scan (v2)
 Fetches US (NYSE/NASDAQ) and Indian (NSE) multi-timeframe data via yfinance.
-Supports:
-  - GET /api/scan?market=US             (cached snapshot)
-  - GET /api/scan?market=IN             (cached snapshot)
-  - GET /api/scan?market=IN&fresh=1     (bypass CDN cache for live Refresh Now / Auto-Refresh)
-  - GET /api/scan?market=ALL            (triggered by daily 10:00 AM IST Vercel Cron Job)
+
+Features:
+  - 50 US (S&P 500 / NASDAQ 100) + 50 India (NIFTY 50 / NSE F&O) tickers
+  - Custom on-demand ticker scanning via &custom=SYM1,SYM2
+  - NIFTY 50 RVOL via NIFTYBEES.NS ETF fallback (since ^NSEI index has 0 volume)
+  - Intraday time-of-day RVOL pace normalization during live market hours
+  - Automatic daily candlestick pattern detection (Pin Bar, Engulfing, Inside Bar)
+  - Multi-timeframe Wilder RSI(14) & EMA/SMA (9, 20, 50, 100, 200) across 1H, D, W, M
+
+Endpoints:
+  - GET /api/scan?market=US
+  - GET /api/scan?market=IN
+  - GET /api/scan?market=IN&fresh=1&custom=DIXON,COFORGE
+  - GET /api/scan?market=ALL   (Daily 10:00 AM IST Vercel Cron Job)
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
 
-IST = timezone(timedelta(hours=5, minutes=30))
+IST = ZoneInfo("Asia/Kolkata")
+ET = ZoneInfo("America/New_York")
 
-US_UNIVERSE = [
-    ("NVDA", "NASDAQ:NVDA", "NVIDIA Corp.", "Semiconductors", ["S&P 500", "NASDAQ 100"]),
-    ("MSFT", "NASDAQ:MSFT", "Microsoft Corp.", "Software", ["S&P 500", "NASDAQ 100"]),
-    ("AAPL", "NASDAQ:AAPL", "Apple Inc.", "Consumer Tech", ["S&P 500", "NASDAQ 100"]),
-    ("META", "NASDAQ:META", "Meta Platforms", "Communication", ["S&P 500", "NASDAQ 100"]),
-    ("AMZN", "NASDAQ:AMZN", "Amazon.com Inc.", "Consumer Discretionary", ["S&P 500", "NASDAQ 100"]),
-    ("GOOGL", "NASDAQ:GOOGL", "Alphabet Inc.", "Communication", ["S&P 500", "NASDAQ 100"]),
-    ("NFLX", "NASDAQ:NFLX", "Netflix Inc.", "Communication", ["S&P 500", "NASDAQ 100"]),
-    ("ORCL", "NYSE:ORCL", "Oracle Corp.", "Software", ["S&P 500"]),
-    ("AVGO", "NASDAQ:AVGO", "Broadcom Inc.", "Semiconductors", ["S&P 500", "NASDAQ 100"]),
-    ("AMD", "NASDAQ:AMD", "Advanced Micro Devices", "Semiconductors", ["S&P 500", "NASDAQ 100"]),
-    ("TSLA", "NASDAQ:TSLA", "Tesla Inc.", "Automotive", ["S&P 500", "NASDAQ 100"]),
-    ("PLTR", "NASDAQ:PLTR", "Palantir Technologies", "Software", ["S&P 500", "NASDAQ 100"]),
-    ("JPM", "NYSE:JPM", "JPMorgan Chase", "Financials", ["S&P 500"]),
-    ("LLY", "NYSE:LLY", "Eli Lilly & Co.", "Healthcare", ["S&P 500"]),
-    ("COST", "NASDAQ:COST", "Costco Wholesale", "Consumer Staples", ["S&P 500", "NASDAQ 100"]),
-    ("PANW", "NASDAQ:PANW", "Palo Alto Networks", "Cybersecurity", ["S&P 500", "NASDAQ 100"]),
-    ("CRM", "NYSE:CRM", "Salesforce Inc.", "Software", ["S&P 500"]),
-    ("INTC", "NASDAQ:INTC", "Intel Corp.", "Semiconductors", ["S&P 500", "NASDAQ 100"]),
-    ("NKE", "NYSE:NKE", "Nike Inc.", "Consumer Discretionary", ["S&P 500"]),
-    ("V", "NYSE:V", "Visa Inc.", "Financials", ["S&P 500"]),
-]
-
-INDIA_UNIVERSE = [
-    ("RELIANCE.NS", "NSE:RELIANCE", "Reliance Industries", "Energy & Retail", ["NIFTY 50", "NSE F&O"]),
-    ("HDFCBANK.NS", "NSE:HDFCBANK", "HDFC Bank Ltd.", "Banking", ["NIFTY 50", "NSE F&O", "Bank Nifty"]),
-    ("ICICIBANK.NS", "NSE:ICICIBANK", "ICICI Bank Ltd.", "Banking", ["NIFTY 50", "NSE F&O", "Bank Nifty"]),
-    ("SBIN.NS", "NSE:SBIN", "State Bank of India", "Banking", ["NIFTY 50", "NSE F&O", "Bank Nifty"]),
-    ("TCS.NS", "NSE:TCS", "Tata Consultancy Services", "IT Services", ["NIFTY 50", "NSE F&O"]),
-    ("INFY.NS", "NSE:INFY", "Infosys Ltd.", "IT Services", ["NIFTY 50", "NSE F&O"]),
-    ("BHARTIARTL.NS", "NSE:BHARTIARTL", "Bharti Airtel Ltd.", "Telecom", ["NIFTY 50", "NSE F&O"]),
-    ("LT.NS", "NSE:LT", "Larsen & Toubro", "Infrastructure", ["NIFTY 50", "NSE F&O"]),
-    ("TRENT.NS", "NSE:TRENT", "Trent Ltd.", "Retail", ["NIFTY 50", "NSE F&O"]),
-    ("BEL.NS", "NSE:BEL", "Bharat Electronics", "Defence", ["NIFTY 50", "NSE F&O"]),
-    ("HAL.NS", "NSE:HAL", "Hindustan Aeronautics", "Defence", ["NSE F&O"]),
-    ("M&M.NS", "NSE:M_M", "Mahindra & Mahindra", "Auto", ["NIFTY 50", "NSE F&O"]),
-    ("TATAMOTORS.NS", "NSE:TATAMOTORS", "Tata Motors Ltd.", "Auto", ["NIFTY 50", "NSE F&O"]),
-    ("BAJFINANCE.NS", "NSE:BAJFINANCE", "Bajaj Finance Ltd.", "NBFC / Financials", ["NIFTY 50", "NSE F&O"]),
-    ("SUNPHARMA.NS", "NSE:SUNPHARMA", "Sun Pharmaceutical", "Pharma", ["NIFTY 50", "NSE F&O"]),
-    ("INDUSINDBK.NS", "NSE:INDUSINDBK", "IndusInd Bank Ltd.", "Banking", ["NIFTY 50", "NSE F&O", "Bank Nifty"]),
-    ("AXISBANK.NS", "NSE:AXISBANK", "Axis Bank Ltd.", "Banking", ["NIFTY 50", "NSE F&O", "Bank Nifty"]),
-    ("KOTAKBANK.NS", "NSE:KOTAKBANK", "Kotak Mahindra Bank", "Banking", ["NIFTY 50", "NSE F&O", "Bank Nifty"]),
-    ("ITC.NS", "NSE:ITC", "ITC Ltd.", "FMCG", ["NIFTY 50", "NSE F&O"]),
-    ("HINDUNILVR.NS", "NSE:HINDUNILVR", "Hindustan Unilever", "FMCG", ["NIFTY 50", "NSE F&O"]),
-]
+try:
+    from api._universes import INDIA_FULL_UNIVERSE as INDIA_UNIVERSE, US_FULL_UNIVERSE as US_UNIVERSE
+except ImportError:
+    from _universes import INDIA_FULL_UNIVERSE as INDIA_UNIVERSE, US_FULL_UNIVERSE as US_UNIVERSE
 
 
 def safe_round(val: Any, digits: int = 2, default: float = 0.0) -> float:
@@ -87,10 +58,11 @@ def wilder_rsi(series: pd.Series, period: int = 14) -> float:
     loss = (-delta).clip(lower=0.0)
     avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    last_gain = float(avg_gain.iloc[-1])
     last_loss = float(avg_loss.iloc[-1])
     if last_loss == 0:
-        return 100.0
-    rs = float(avg_gain.iloc[-1]) / last_loss
+        return 50.0 if last_gain == 0 else 100.0
+    rs = last_gain / last_loss
     return safe_round(100.0 - (100.0 / (1.0 + rs)), 1, 50.0)
 
 
@@ -117,7 +89,123 @@ def compute_mas(series: pd.Series) -> dict[str, float]:
     }
 
 
-def download_chunked(tickers: list[str], period: str, interval: str, chunk_size: int = 25) -> dict[str, pd.DataFrame]:
+def detect_candlestick_pattern(df: pd.DataFrame) -> str | None:
+    """Detect daily candlestick confirmation patterns on the latest completed/active bar."""
+    if df is None or len(df) < 2:
+        return None
+    needed = {"Open", "High", "Low", "Close"}
+    if not needed.issubset(df.columns):
+        return None
+
+    clean = df[["Open", "High", "Low", "Close"]].dropna()
+    if len(clean) < 2:
+        return None
+
+    prev = clean.iloc[-2]
+    curr = clean.iloc[-1]
+
+    p_o, p_h, p_l, p_c = float(prev["Open"]), float(prev["High"]), float(prev["Low"]), float(prev["Close"])
+    c_o, c_h, c_l, c_c = float(curr["Open"]), float(curr["High"]), float(curr["Low"]), float(curr["Close"])
+
+    rng = c_h - c_l
+    if rng <= 0:
+        return None
+
+    body = abs(c_c - c_o)
+    upper_wick = c_h - max(c_o, c_c)
+    lower_wick = min(c_o, c_c) - c_l
+    body_eff = max(body, rng * 0.05)
+
+    # 1. Bullish / Bearish Engulfing
+    if p_c < p_o and c_c > c_o and c_o <= p_c and c_c >= p_o and body > abs(p_c - p_o):
+        return "Bull Engulfing"
+    if p_c > p_o and c_c < c_o and c_o >= p_c and c_c <= p_o and body > abs(p_c - p_o):
+        return "Bear Engulfing"
+
+    # 2. Bullish / Bearish Pin Bar (long rejection wick >= 2x body and >= 55% of total range)
+    if lower_wick >= 2.0 * body_eff and lower_wick >= 0.55 * rng and upper_wick <= 0.25 * rng:
+        return "Bull Pin Bar"
+    if upper_wick >= 2.0 * body_eff and upper_wick >= 0.55 * rng and lower_wick <= 0.25 * rng:
+        return "Bear Pin Bar"
+
+    # 3. Inside Bar
+    if c_h <= p_h and c_l >= p_l:
+        return "Inside Bar"
+
+    return None
+
+
+def get_session_pace_factor(market_code: str, last_bar_date: Any, now_utc: datetime | None = None) -> tuple[float, bool]:
+    """
+    Return (elapsed_fraction, is_pace_adjusted).
+    When the latest daily candle belongs to today's live trading session, normalize volume
+    by elapsed session time (clamped to >= 8% so opening-minute spikes stay sane).
+    """
+    now = now_utc or datetime.now(timezone.utc)
+    if market_code == "US":
+        local_now = now.astimezone(ET)
+        open_mins, close_mins = 9 * 60 + 30, 16 * 60  # 390 mins
+    else:
+        local_now = now.astimezone(IST)
+        open_mins, close_mins = 9 * 60 + 15, 15 * 60 + 30  # 375 mins
+
+    if local_now.weekday() >= 5:
+        return 1.0, False
+
+    bar_date_str = str(last_bar_date)[:10] if last_bar_date is not None else ""
+    if bar_date_str != local_now.strftime("%Y-%m-%d"):
+        return 1.0, False
+
+    cur_mins = local_now.hour * 60 + local_now.minute
+    if open_mins <= cur_mins < close_mins:
+        elapsed = max(1, cur_mins - open_mins)
+        fraction = max(0.08, min(1.0, elapsed / float(close_mins - open_mins)))
+        return fraction, True
+
+    return 1.0, False
+
+
+def compute_rvol(vol_series: pd.Series, pace_factor: float = 1.0) -> tuple[int, int, float]:
+    vol = vol_series.dropna().astype(float)
+    if vol.empty:
+        return 0, 0, 0.0
+    last_vol = int(max(0.0, float(vol.iloc[-1])))
+    prior = vol.tail(21).iloc[:-1] if len(vol) > 2 else vol
+    avg_20 = int(max(0.0, float(prior.mean()))) if not prior.empty else 0
+    if avg_20 <= 0 or last_vol <= 0:
+        return last_vol, avg_20, 0.0
+    projected_vol = last_vol / max(0.08, min(1.0, pace_factor))
+    return last_vol, avg_20, safe_round(projected_vol / avg_20, 2, 0.0)
+
+
+def parse_custom_tickers(raw_param: str, market_code: str, existing_symbols: set[str]) -> list[tuple[str, str, str, str, list[str]]]:
+    """Sanitize & normalize comma-separated custom tickers for US or India (NSE)."""
+    if not raw_param:
+        return []
+    out: list[tuple[str, str, str, str, list[str]]] = []
+    seen = set(existing_symbols)
+    for token in raw_param.split(","):
+        cleaned = re.sub(r"[^A-Za-z0-9.&_-]", "", token.strip().upper())
+        if not cleaned or len(cleaned) > 20:
+            continue
+        if market_code == "IN":
+            base_sym = cleaned.replace(".NS", "").replace(".BO", "")
+            yf_ticker = cleaned if cleaned.endswith((".NS", ".BO")) else f"{base_sym}.NS"
+            tv_sym = f"NSE:{base_sym.replace('&', '_').replace('-', '_')}"
+        else:
+            base_sym = cleaned
+            yf_ticker = cleaned
+            tv_sym = cleaned
+        if base_sym in seen:
+            continue
+        seen.add(base_sym)
+        out.append((yf_ticker, tv_sym, f"{base_sym} (Custom)", "Custom Watchlist", ["Custom"]))
+        if len(out) >= 15:
+            break
+    return out
+
+
+def download_chunked(tickers: list[str], period: str, interval: str, chunk_size: int = 45) -> dict[str, pd.DataFrame]:
     result: dict[str, pd.DataFrame] = {}
     for i in range(0, len(tickers), chunk_size):
         batch = tickers[i : i + chunk_size]
@@ -137,37 +225,47 @@ def download_chunked(tickers: list[str], period: str, interval: str, chunk_size:
                     if not df.empty:
                         result[t] = df.dropna(how="all")
                 else:
+                    cols_l0 = set(df.columns.get_level_values(0))
                     for t in batch:
-                        if t in df.columns.get_level_values(0):
+                        if t in cols_l0:
                             sub = df[t].dropna(how="all")
                             if not sub.empty:
                                 result[t] = sub
                 break
             except Exception:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(1.0 * (attempt + 1))
     return result
 
 
-def build_benchmark(label: str, name: str, daily_df: pd.DataFrame | None) -> dict[str, Any]:
+def build_benchmark(
+    label: str,
+    name: str,
+    daily_df: pd.DataFrame | None,
+    market_code: str,
+    vol_proxy_df: pd.DataFrame | None = None,
+) -> dict[str, Any]:
     if daily_df is None or len(daily_df) < 2:
         return {
             "symbol": label,
             "name": name,
             "price": 0.0,
             "changePct": 0.0,
-            "rvol": 1.0,
+            "rvol": 0.0,
             "above20Ema": True,
             "above50Ema": True,
             "breadthUp": 50,
         }
     close = daily_df["Close"].dropna()
-    vol = daily_df["Volume"].dropna()
     price = safe_round(close.iloc[-1], 2)
     prev = safe_round(close.iloc[-2], 2, price)
     chg_pct = safe_round(((price - prev) / prev) * 100.0 if prev else 0.0, 2)
-    avg20 = float(vol.tail(21).iloc[:-1].mean()) if len(vol) > 2 else 0.0
-    last_vol = float(vol.iloc[-1]) if len(vol) else 0.0
-    rvol = safe_round(last_vol / avg20 if avg20 > 0 else 1.0, 2, 1.0)
+
+    pace, _ = get_session_pace_factor(market_code, close.index[-1])
+    _, _, rvol = compute_rvol(daily_df["Volume"], pace)
+    if rvol <= 0 and vol_proxy_df is not None and "Volume" in vol_proxy_df:
+        proxy_pace, _ = get_session_pace_factor(market_code, vol_proxy_df.index[-1])
+        _, _, rvol = compute_rvol(vol_proxy_df["Volume"], proxy_pace)
+
     mas = compute_mas(close)
     return {
         "symbol": label,
@@ -181,33 +279,42 @@ def build_benchmark(label: str, name: str, daily_df: pd.DataFrame | None) -> dic
     }
 
 
-def scan_market(market_code: str) -> dict[str, Any]:
+def scan_market(market_code: str, custom_raw: str = "") -> dict[str, Any]:
     if market_code == "US":
         exchange, currency = "NYSE / NASDAQ", "$"
-        universe = US_UNIVERSE
+        base_universe = list(US_UNIVERSE)
         primary_bench = ("SPY", "SPY", "S&P 500 ETF")
         secondary_bench = ("QQQ", "QQQ", "NASDAQ 100 ETF")
+        vol_proxy_ticker = None
     else:
         market_code = "IN"
         exchange, currency = "NSE", "₹"
-        universe = INDIA_UNIVERSE
+        base_universe = list(INDIA_UNIVERSE)
         primary_bench = ("^NSEI", "NIFTY 50", "NSE Nifty 50 Index")
         secondary_bench = ("^NSEBANK", "BANK NIFTY", "Nifty Bank Index")
+        vol_proxy_ticker = "NIFTYBEES.NS"
+
+    existing_syms = {row[0].replace(".NS", "").replace(".BO", "") for row in base_universe}
+    custom_rows = parse_custom_tickers(custom_raw, market_code, existing_syms)
+    universe = base_universe + custom_rows
 
     all_tickers = [row[0] for row in universe] + [primary_bench[0], secondary_bench[0]]
+    if vol_proxy_ticker:
+        all_tickers.append(vol_proxy_ticker)
+
     daily_map = download_chunked(all_tickers, period="5y", interval="1d")
-    hourly_map = download_chunked(all_tickers, period="60d", interval="60m")
+    hourly_map = download_chunked([row[0] for row in universe], period="60d", interval="60m")
 
     stocks_out: list[dict[str, Any]] = []
     advancing = 0
+    any_pace_adjusted = False
 
     for yf_ticker, tv_symbol, name, sector, tags in universe:
         ddf = daily_map.get(yf_ticker)
-        if ddf is None or len(ddf) < 25:
+        if ddf is None or len(ddf) < 20:
             continue
 
         close_d = ddf["Close"].dropna()
-        vol_d = ddf["Volume"].dropna()
         if len(close_d) < 2:
             continue
 
@@ -217,9 +324,10 @@ def scan_market(market_code: str) -> dict[str, Any]:
         if change_pct > 0:
             advancing += 1
 
-        last_vol = int(vol_d.iloc[-1]) if len(vol_d) else 0
-        avg_vol_20 = int(vol_d.tail(21).iloc[:-1].mean()) if len(vol_d) > 2 else max(1, last_vol)
-        rvol = safe_round(last_vol / avg_vol_20 if avg_vol_20 > 0 else 1.0, 2, 1.0)
+        pace, is_pace = get_session_pace_factor(market_code, close_d.index[-1])
+        if is_pace:
+            any_pace_adjusted = True
+        last_vol, avg_vol_20, rvol = compute_rvol(ddf["Volume"], pace)
 
         close_w = close_d.resample("W-FRI").last().dropna()
         close_m = close_d.resample("ME").last().dropna()
@@ -228,6 +336,7 @@ def scan_market(market_code: str) -> dict[str, Any]:
 
         clean_symbol = yf_ticker.replace(".NS", "").replace(".BO", "")
         history = [safe_round(v, 2) for v in close_d.tail(12).tolist()]
+        pattern = detect_candlestick_pattern(ddf)
 
         stocks_out.append(
             {
@@ -241,6 +350,8 @@ def scan_market(market_code: str) -> dict[str, Any]:
                 "volume": last_vol,
                 "avgVolume20": avg_vol_20,
                 "rvol": rvol,
+                "rvolPaceAdjusted": is_pace,
+                "pattern": pattern,
                 "rsi": {
                     "1H": wilder_rsi(close_1h),
                     "D": wilder_rsi(close_d),
@@ -257,19 +368,22 @@ def scan_market(market_code: str) -> dict[str, Any]:
             }
         )
 
-    bench = build_benchmark(primary_bench[1], primary_bench[2], daily_map.get(primary_bench[0]))
+    vol_proxy_df = daily_map.get(vol_proxy_ticker) if vol_proxy_ticker else None
+    bench = build_benchmark(primary_bench[1], primary_bench[2], daily_map.get(primary_bench[0]), market_code, vol_proxy_df)
     bench["breadthUp"] = round((advancing / max(1, len(stocks_out))) * 100)
-    sec_bench = build_benchmark(secondary_bench[1], secondary_bench[2], daily_map.get(secondary_bench[0]))
+    sec_bench = build_benchmark(secondary_bench[1], secondary_bench[2], daily_map.get(secondary_bench[0]), market_code)
 
     now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
+    pace_tag = " • Intraday Pace RVOL" if any_pace_adjusted else ""
     return {
         "market": market_code,
         "exchange": exchange,
         "currency": currency,
         "benchmark": bench,
         "secondaryBenchmark": sec_bench,
-        "asOfLabel": f"Synced {now_ist} (Live API)",
-        "source": "vercel-yfinance",
+        "rvolPaceAdjusted": any_pace_adjusted,
+        "asOfLabel": f"Synced {now_ist} (Live API{pace_tag})",
+        "source": "vercel-yfinance-v3",
         "stocks": stocks_out,
     }
 
@@ -280,6 +394,7 @@ class handler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         market = (params.get("market", ["IN"])[0] or "IN").upper()
         fresh = params.get("fresh", ["0"])[0] == "1"
+        custom_raw = params.get("custom", [""])[0] or ""
 
         try:
             if market == "ALL":
@@ -289,16 +404,15 @@ class handler(BaseHTTPRequestHandler):
                     "IN": scan_market("IN"),
                 }
             else:
-                payload = scan_market("US" if market == "US" else "IN")
+                payload = scan_market("US" if market == "US" else "IN", custom_raw=custom_raw)
 
             body = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
-            if fresh:
+            if fresh or custom_raw:
                 self.send_header("Cache-Control", "no-store")
             else:
-                # Edge cache for 1 hour, serve stale while revalidating for 24h
                 self.send_header("Cache-Control", "public, s-maxage=3600, stale-while-revalidate=86400")
             self.end_headers()
             self.wfile.write(body)
