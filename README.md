@@ -25,3 +25,9 @@ A $0/month, deploy-once React stock scanner for **US (NYSE/NASDAQ)** and **India
 
 ## Expanding Your Stock Universe
 Edit `US_UNIVERSE` and `INDIA_UNIVERSE` inside `api/scan.py` (append `.NS` for NSE tickers) and push to `main`—Vercel updates automatically.
+
+## Optional Free Speed Boost: Upstash Redis Baseline Cache (Recommended)
+To make **Refresh Now** and **Auto-Refresh** finish in just a few seconds (even after cold starts) at **$0/month**:
+1. Open your project in the **Vercel Dashboard → Storage → Create Database → Upstash Redis** (Free tier).
+2. Click **Connect Project** (Vercel automatically adds `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`).
+3. Redeploy once. The first scan each day caches the compressed 2-year historical baseline in Redis, and every refresh after that only downloads a tiny 5-day incremental update.
